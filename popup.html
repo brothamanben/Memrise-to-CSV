@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Memrise Export</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Memrise Export</h1>
+        <p>Export one open lesson with audio/video.</p>
+      </header>
+
+      <section class="stats">
+        <div><strong id="rowCount">0</strong><span>rows</span></div>
+        <div><strong id="audioCount">0</strong><span>audio</span></div>
+        <div><strong id="videoCount">0</strong><span>video</span></div>
+      </section>
+
+      <label class="check">
+        <input id="videoSoundTag" type="checkbox" checked>
+        Put videos in Anki media format too
+      </label>
+
+      <div class="buttons">
+        <button id="detectLesson">Detect lesson</button>
+        <button id="revealLesson">Open words + capture media</button>
+        <button id="exportLesson">Export lesson</button>
+      </div>
+
+      <p id="status">Open one Memrise lesson, then detect.</p>
+      <textarea id="preview" spellcheck="false" readonly></textarea>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

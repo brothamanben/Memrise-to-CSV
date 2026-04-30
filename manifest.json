@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Memrise Anki Media Exporter",
+  "version": "1.0.0",
+  "description": "Exports Memrise page vocabulary with MP3/MP4 media references for Anki CSV imports.",
+  "permissions": [
+    "activeTab",
+    "downloads",
+    "scripting",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Memrise Export",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
