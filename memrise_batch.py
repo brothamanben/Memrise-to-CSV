@@ -1,13 +1,11 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 import csv
 import re
 import threading
 
-import requests
 from playwright.sync_api import sync_playwright
 
-from memrise import (
+from memrise_single_lesson import (
     OUTPUT_DIR,
     PROFILE_DIR,
     clean_name,
@@ -17,12 +15,9 @@ from memrise import (
 )
 
 
-MAX_LESSON_WORKERS = 4
-MAX_LEARNABLE_WORKERS = 12
 MAX_MEDIA_WORKERS = 12
 
 print_lock = threading.Lock()
-thread_local = threading.local()
 
 
 def log(message=""):
@@ -82,85 +77,100 @@ def collect_scenario_ids():
     return scenario_ids
 
 
-def build_auth_config_from_browser_context(context):
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://app.memrise.com/",
-    }
+def fetch_lessons_in_browser(page, scenario_ids):
+    return page.evaluate(
+        """
+        async (scenarioIds) => {
+            const getJson = async (url) => {
+                const response = await fetch(url, { credentials: "include" });
+                const text = await response.text();
 
-    cookies = context.cookies("https://app.memrise.com")
-    return {"headers": headers, "cookies": cookies}
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${text.slice(0, 500)}`);
+                }
 
+                return JSON.parse(text);
+            };
 
-def build_session(auth_config):
-    session = requests.Session()
-    session.headers.update(auth_config["headers"])
+            return await Promise.all(scenarioIds.map(async (scenarioId) => {
+                try {
+                    const scenario = await getJson(
+                        `https://app.memrise.com/v1.25/me/scenarios/${scenarioId}/details/`
+                    );
+                    const learnableIds = (scenario.learnables || [])
+                        .map((item) => item.learnable_id)
+                        .filter(Boolean);
 
-    for cookie in auth_config["cookies"]:
-        session.cookies.set(
-            cookie["name"],
-            cookie["value"],
-            domain=cookie.get("domain"),
-            path=cookie.get("path", "/"),
-        )
+                    const learnables = await Promise.all(learnableIds.map(
+                        async (learnableId, index) => {
+                            const details = await getJson(
+                                `https://app.memrise.com/v1.25/learnable_details/${learnableId}/`
+                            );
 
-    return session
+                            return {
+                                index: index + 1,
+                                learnable_id: learnableId,
+                                details,
+                            };
+                        }
+                    ));
 
-
-def get_thread_session(auth_config):
-    session = getattr(thread_local, "session", None)
-    if session is None:
-        session = build_session(auth_config)
-        thread_local.session = session
-    return session
-
-
-def get_json(auth_config, url):
-    session = get_thread_session(auth_config)
-    response = session.get(url, timeout=60)
-    response.raise_for_status()
-    return response.json()
-
-
-def fetch_learnable(auth_config, index, learnable_id):
-    details = get_json(
-        auth_config,
-        f"https://app.memrise.com/v1.25/learnable_details/{learnable_id}/",
+                    return {
+                        scenario_id: scenarioId,
+                        learnable_count: learnableIds.length,
+                        learnables,
+                    };
+                } catch (error) {
+                    return {
+                        scenario_id: scenarioId,
+                        error: String(error && error.message ? error.message : error),
+                    };
+                }
+            }));
+        }
+        """,
+        scenario_ids,
     )
 
-    front = details.get("source_value", "") or ""
-    back = details.get("target_value", "") or ""
-    base = f"{index:03d}_{clean_name(front)}"
 
-    audio_items = []
-    for i, url in enumerate(details.get("audio_urls") or [], start=1):
-        audio_items.append(
+def rows_from_lesson_payload(payload):
+    rows = []
+
+    for item in sorted(payload["learnables"], key=lambda value: value["index"]):
+        index = item["index"]
+        details = item["details"]
+        front = details.get("source_value", "") or ""
+        back = details.get("target_value", "") or ""
+        base = f"{index:03d}_{clean_name(front)}"
+
+        audio_items = []
+        for i, url in enumerate(details.get("audio_urls") or [], start=1):
+            audio_items.append(
+                {
+                    "url": url,
+                    "filename": f"{base}_audio_{i}.mp3",
+                }
+            )
+
+        video_items = []
+        for i, url in enumerate(details.get("video_urls") or [], start=1):
+            video_items.append(
+                {
+                    "url": url,
+                    "filename": f"{base}_video_{i}.mp4",
+                }
+            )
+
+        rows.append(
             {
-                "url": url,
-                "filename": f"{base}_audio_{i}.mp3",
+                "front": front,
+                "back": back,
+                "audio": audio_items,
+                "video": video_items,
             }
         )
 
-    video_items = []
-    for i, url in enumerate(details.get("video_urls") or [], start=1):
-        video_items.append(
-            {
-                "url": url,
-                "filename": f"{base}_video_{i}.mp4",
-            }
-        )
-
-    return {
-        "front": front,
-        "back": back,
-        "audio": audio_items,
-        "video": video_items,
-    }
+    return rows
 
 
 def write_csv(rows, csv_path):
@@ -213,7 +223,8 @@ def download_lesson_media(rows, audio_dir, video_dir):
             future.result()
 
 
-def export_lesson(auth_config, scenario_id):
+def export_lesson_payload(payload):
+    scenario_id = payload["scenario_id"]
     log(f"\n[{scenario_id}] Getting scenario details...")
 
     lesson_dir = OUTPUT_DIR / f"memrise_{scenario_id}"
@@ -225,30 +236,8 @@ def export_lesson(auth_config, scenario_id):
     audio_dir.mkdir(parents=True, exist_ok=True)
     video_dir.mkdir(parents=True, exist_ok=True)
 
-    data = get_json(
-        auth_config,
-        f"https://app.memrise.com/v1.25/me/scenarios/{scenario_id}/details/",
-    )
-    learnables = data.get("learnables") or []
-    learnable_ids = [
-        item.get("learnable_id") for item in learnables if item.get("learnable_id")
-    ]
-
-    log(f"[{scenario_id}] Found {len(learnable_ids)} learnables.")
-
-    rows_by_index = {}
-    with ThreadPoolExecutor(max_workers=MAX_LEARNABLE_WORKERS) as executor:
-        futures = {
-            executor.submit(fetch_learnable, auth_config, index, learnable_id): index
-            for index, learnable_id in enumerate(learnable_ids, start=1)
-        }
-
-        for future in as_completed(futures):
-            index = futures[future]
-            rows_by_index[index] = future.result()
-            log(f"[{scenario_id}] Read {len(rows_by_index)}/{len(learnable_ids)}")
-
-    rows = [rows_by_index[index] for index in sorted(rows_by_index)]
+    log(f"[{scenario_id}] Found {payload['learnable_count']} learnables.")
+    rows = rows_from_lesson_payload(payload)
 
     log(f"[{scenario_id}] Writing CSV and media list...")
     write_csv(rows, csv_path)
@@ -267,15 +256,6 @@ def export_lesson(auth_config, scenario_id):
 
 
 def main():
-    scenario_ids = collect_scenario_ids()
-    if not scenario_ids:
-        print("\nNo lesson/scenario IDs found. Exiting.")
-        return
-
-    print("\nLessons queued:")
-    for scenario_id in scenario_ids:
-        print(" -", scenario_id)
-
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             user_data_dir=str(PROFILE_DIR),
@@ -288,18 +268,36 @@ def main():
 
         input(
             "\nBrowser opened.\n"
-            "Log into Memrise if needed, then press ENTER here to start the batch.\n\n"
+            "Log into Memrise if needed, then press ENTER here.\n\n"
         )
 
-        auth_config = build_auth_config_from_browser_context(context)
+        scenario_ids = collect_scenario_ids()
+        if not scenario_ids:
+            print("\nNo lesson/scenario IDs found. Exiting.")
+            context.close()
+            return
+
+        print("\nLessons queued:")
+        for scenario_id in scenario_ids:
+            print(" -", scenario_id)
+
+        print("\nReading lessons through the logged-in browser...")
+        lesson_payloads = fetch_lessons_in_browser(page, scenario_ids)
 
         results = []
         errors = []
 
-        with ThreadPoolExecutor(max_workers=MAX_LESSON_WORKERS) as executor:
+        for payload in lesson_payloads:
+            if payload.get("error"):
+                errors.append((payload["scenario_id"], payload["error"]))
+                log(f"\n[{payload['scenario_id']}] Failed: {payload['error']}")
+
+        successful_payloads = [payload for payload in lesson_payloads if not payload.get("error")]
+
+        with ThreadPoolExecutor(max_workers=min(len(successful_payloads), 4) or 1) as executor:
             futures = {
-                executor.submit(export_lesson, auth_config, scenario_id): scenario_id
-                for scenario_id in scenario_ids
+                executor.submit(export_lesson_payload, payload): payload["scenario_id"]
+                for payload in successful_payloads
             }
 
             for future in as_completed(futures):
