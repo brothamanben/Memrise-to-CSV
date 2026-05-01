@@ -1,0 +1,96 @@
+(async () => {
+  const scenario_id = 46063; // CHANGE THIS ONLY
+
+  function csvEscape(v) {
+    return `"${String(v ?? "").replace(/"/g, '""')}"`;
+  }
+
+  function cleanName(v) {
+    return String(v || "item")
+      .normalize("NFKD")
+      .replace(/[^\p{L}\p{N}._ -]+/gu, "")
+      .trim()
+      .replace(/\s+/g, "_")
+      .slice(0, 60) || "item";
+  }
+
+  function downloadText(filename, text) {
+    const blob = new Blob([text], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  }
+
+  const learnable_ids = await fetch(
+    `https://app.memrise.com/v1.25/me/scenarios/${scenario_id}/details/`
+  )
+    .then(r => r.json())
+    .then(r => r.learnables.map(L => L.learnable_id));
+
+  const scenario_data = await Promise.all(
+    learnable_ids.map(id =>
+      fetch(`https://app.memrise.com/v1.25/learnable_details/${id}/`)
+        .then(r => r.json())
+    )
+  );
+
+  const rows = scenario_data.map((item, index) => {
+    const front = item.source_value || "";
+    const back = item.target_value || "";
+
+    const base = `${String(index + 1).padStart(3, "0")}_${cleanName(front)}`;
+
+    const audio = (item.audio_urls || []).map((url, i) => ({
+      url,
+      filename: `${base}_audio_${i + 1}.mp3`
+    }));
+
+    const video = (item.video_urls || []).map((url, i) => ({
+      url,
+      filename: `${base}_video_${i + 1}.mp4`
+    }));
+
+    return { front, back, audio, video };
+  });
+
+  const csvLines = [
+    ["Front", "Back", "Audio", "Video"].map(csvEscape).join(",")
+  ];
+
+  for (const row of rows) {
+    csvLines.push([
+      row.front,
+      row.back,
+      row.audio.map(a => `[sound:${a.filename}]`).join(" "),
+      row.video.map(v => `[sound:${v.filename}]`).join(" ")
+    ].map(csvEscape).join(","));
+  }
+
+  const csv = csvLines.join("\r\n") + "\r\n";
+  downloadText(`memrise_${scenario_id}.csv`, csv);
+
+  const mediaList = rows.flatMap(row => [
+    ...row.audio.map(a => `${a.url} -> ${a.filename}`),
+    ...row.video.map(v => `${v.url} -> ${v.filename}`)
+  ]);
+
+  window.memriseRows = rows;
+  window.memriseMediaList = mediaList;
+
+  console.table(rows.map(r => ({
+    Front: r.front,
+    Back: r.back,
+    Audio: r.audio.length,
+    Video: r.video.length
+  })));
+
+  console.log("Media list saved as window.memriseMediaList");
+  console.log(mediaList.join("\n"));
+
+  alert(`CSV downloaded. Rows: ${rows.length}. Media links are in window.memriseMediaList.`);
+})();
