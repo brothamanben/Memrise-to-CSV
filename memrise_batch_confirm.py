@@ -41,7 +41,7 @@ def start_command_log():
     log_dir = Path("memrise_logs")
     log_dir.mkdir(exist_ok=True)
 
-    log_path = log_dir / f"memrise_batch_{datetime.now():%Y%m%d_%H%M%S}.log"
+    log_path = log_dir / f"memrise_batch_confirm_{datetime.now():%Y%m%d_%H%M%S}.log"
     log_file = open(log_path, "w", encoding="utf-8", buffering=1)
 
     original_stdout = sys.stdout
@@ -113,9 +113,9 @@ def collect_scenario_ids():
 def choose_input_mode():
     capture_count = len(load_scenarios_from_capture_csv())
     capture_label = (
-        f"Use saved network capture file ({capture_count} IDs found)"
+        f"Use saved scenario file ({capture_count} IDs found)"
         if capture_count
-        else "Use saved network capture file (none found yet)"
+        else "Use saved scenario file (none found yet)"
     )
 
     print(
@@ -165,9 +165,16 @@ def save_discovered_scenarios(scenarios):
 
 
 def load_scenarios_from_capture_csv():
-    capture_csv = Path("memrise_network_capture") / "memrise_scenarios.csv"
-    if not capture_csv.exists():
+    candidate_paths = [
+        Path("memrise_network_capture") / "memrise_scenarios.csv",
+        OUTPUT_DIR / "memrise_discovered_scenarios.csv",
+    ]
+
+    capture_csv = next((path for path in candidate_paths if path.exists()), None)
+    if capture_csv is None:
         return []
+
+    print(f"Saved scenario source: {capture_csv}")
 
     scenarios = []
     seen = set()
@@ -185,9 +192,9 @@ def load_scenarios_from_capture_csv():
                 {
                     "scenario_id": scenario_id,
                     "title": row.get("title", ""),
-                    "topic_id": "",
-                    "topic_name": "",
-                    "number_of_learnables": "",
+                    "topic_id": row.get("topic_id", ""),
+                    "topic_name": row.get("topic_name", ""),
+                    "number_of_learnables": row.get("number_of_learnables", ""),
                     "link": row.get("link")
                     or (
                         "https://app.memrise.com/aprender/learn?"
@@ -197,6 +204,167 @@ def load_scenarios_from_capture_csv():
             )
 
     return scenarios
+
+
+def scenario_link(scenario_id):
+    return (
+        "https://app.memrise.com/aprender/learn?"
+        f"scenario_id={scenario_id}&source=scenarios_tab&back=%2Flearn"
+    )
+
+
+def load_title_map_from_capture_csv():
+    return {
+        item["scenario_id"]: item.get("title", "")
+        for item in load_scenarios_from_capture_csv()
+    }
+
+
+def scenarios_from_manual_ids(scenario_ids):
+    title_map = load_title_map_from_capture_csv()
+    scenarios = []
+
+    for scenario_id in scenario_ids:
+        scenario_id = str(scenario_id).strip()
+        if not scenario_id.isdigit():
+            continue
+
+        scenarios.append(
+            {
+                "scenario_id": scenario_id,
+                "title": title_map.get(scenario_id, "(title not found yet)"),
+                "topic_id": "",
+                "topic_name": "",
+                "number_of_learnables": "",
+                "link": scenario_link(scenario_id),
+            }
+        )
+
+    return scenarios
+
+
+def scenario_sort_key(item):
+    scenario_id = str(item.get("scenario_id") or "")
+    return int(scenario_id) if scenario_id.isdigit() else scenario_id
+
+
+def print_scenario_review(scenarios):
+    review_path = OUTPUT_DIR / "memrise_download_review.csv"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    with open(review_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "scenario_id",
+                "title",
+                "topic_id",
+                "topic_name",
+                "number_of_learnables",
+                "link",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(sorted(scenarios, key=scenario_sort_key))
+
+    print(f"\nReview CSV saved: {review_path}")
+    print("\nScenario Review")
+    print("-" * 100)
+    print(f"{'#':>4}  {'Scenario ID':<12}  {'Lesson Name':<45}  {'Items':>7}  Topic")
+    print("-" * 100)
+
+    for index, scenario in enumerate(sorted(scenarios, key=scenario_sort_key), start=1):
+        scenario_id = str(scenario.get("scenario_id") or "")
+        title = re.sub(r"\s+", " ", str(scenario.get("title") or "(no title)")).strip()
+        topic_name = re.sub(r"\s+", " ", str(scenario.get("topic_name") or "")).strip()
+        item_count = str(scenario.get("number_of_learnables") or "")
+
+        if len(title) > 45:
+            title = title[:42] + "..."
+
+        print(f"{index:>4}  {scenario_id:<12}  {title:<45}  {item_count:>7}  {topic_name}")
+
+    print("-" * 100)
+    print(f"Total scenarios ready to download: {len(scenarios)}")
+
+
+def confirm_download(scenarios):
+    while True:
+        answer = input("\nDownload these lessons now? Type yes or no: ").strip().lower()
+
+        if answer in {"yes", "y"}:
+            return True
+        if answer in {"no", "n"}:
+            return False
+
+        print("Please type yes or no.")
+
+
+def parse_lesson_selection(value, total):
+    value = str(value or "").strip().lower()
+    if not value or value in {"all", "*"}:
+        return list(range(total))
+
+    if value.isdigit():
+        count = int(value)
+        if 1 <= count <= total:
+            return list(range(count))
+        raise ValueError(f"Count must be between 1 and {total}.")
+
+    selected = []
+    seen = set()
+
+    for part in re.split(r"[,\s]+", value):
+        if not part:
+            continue
+
+        if "-" in part:
+            start_text, end_text = part.split("-", 1)
+            if not start_text.isdigit() or not end_text.isdigit():
+                raise ValueError(f"Invalid range: {part}")
+
+            start = int(start_text)
+            end = int(end_text)
+            if start > end:
+                start, end = end, start
+
+            numbers = range(start, end + 1)
+        elif part.isdigit():
+            numbers = [int(part)]
+        else:
+            raise ValueError(f"Invalid lesson number: {part}")
+
+        for number in numbers:
+            if not 1 <= number <= total:
+                raise ValueError(f"Lesson number {number} is outside 1-{total}.")
+
+            index = number - 1
+            if index not in seen:
+                seen.add(index)
+                selected.append(index)
+
+    return selected
+
+
+def choose_scenarios_to_download(scenarios):
+    print_scenario_review(scenarios)
+
+    print(
+        "\nChoose lessons to download.\n"
+        "- Press ENTER or type all for every lesson.\n"
+        "- Type a number like 14 to download the first 14 lessons.\n"
+        "- Type ranges like 1-7 or 8-14, or combine them like 1-7,15,20-25.\n"
+    )
+
+    while True:
+        answer = input("Lessons to download: ").strip()
+        try:
+            selected_indexes = parse_lesson_selection(answer, len(scenarios))
+        except ValueError as e:
+            print(e)
+            continue
+
+        return [scenarios[index] for index in selected_indexes]
 
 
 def list_language_pairs_in_browser(page):
@@ -791,7 +959,7 @@ def main():
             input_mode = choose_input_mode()
 
             if input_mode == "capture":
-                print("\nLoading scenario IDs from memrise_network_capture\\memrise_scenarios.csv...")
+                print("\nLoading scenario IDs from the saved scenario file...")
                 scenarios = load_scenarios_from_capture_csv()
                 print(f"Scenarios loaded from capture CSV: {len(scenarios)}")
 
@@ -821,22 +989,48 @@ def main():
                 save_discovered_scenarios(scenarios)
                 scenario_ids = [item["scenario_id"] for item in scenarios]
             else:
-                scenario_ids = collect_scenario_ids()
+                scenarios = scenarios_from_manual_ids(collect_scenario_ids())
+                save_discovered_scenarios(scenarios)
+                scenario_ids = [item["scenario_id"] for item in scenarios]
 
-            scenario_ids = [
-                str(scenario_id).strip()
-                for scenario_id in scenario_ids
-                if str(scenario_id).strip().isdigit()
-            ]
+            deduped_scenarios = []
+            seen_scenario_ids = set()
+
+            for scenario in scenarios:
+                scenario_id = str(scenario.get("scenario_id") or "").strip()
+                if not scenario_id.isdigit() or scenario_id in seen_scenario_ids:
+                    continue
+
+                seen_scenario_ids.add(scenario_id)
+                scenario["scenario_id"] = scenario_id
+                if not scenario.get("link"):
+                    scenario["link"] = scenario_link(scenario_id)
+                deduped_scenarios.append(scenario)
+
+            scenarios = sorted(deduped_scenarios, key=scenario_sort_key)
+            scenario_ids = [item["scenario_id"] for item in scenarios]
 
             if not scenario_ids:
                 print("\nNo lesson/scenario IDs found. Exiting.")
                 context.close()
                 return
 
+            scenarios = choose_scenarios_to_download(scenarios)
+            scenario_ids = [item["scenario_id"] for item in scenarios]
+
+            if not scenario_ids:
+                print("\nNo lessons selected. Exiting.")
+                context.close()
+                return
+
+            if not confirm_download(scenarios):
+                print("\nDownload canceled. Nothing was downloaded.")
+                context.close()
+                return
+
             print("\nLessons queued:")
-            for scenario_id in scenario_ids:
-                print(" -", scenario_id)
+            for scenario in scenarios:
+                print(f" - {scenario['scenario_id']}: {scenario.get('title') or '(no title)'}")
 
             print("\nReading lessons through the logged-in browser...")
             lesson_payloads = fetch_lessons_in_browser_chunks(page, scenario_ids)

@@ -41,7 +41,7 @@ def start_command_log():
     log_dir = Path("memrise_logs")
     log_dir.mkdir(exist_ok=True)
 
-    log_path = log_dir / f"memrise_batch_{datetime.now():%Y%m%d_%H%M%S}.log"
+    log_path = log_dir / f"memrise_batch_multi_language_{datetime.now():%Y%m%d_%H%M%S}.log"
     log_file = open(log_path, "w", encoding="utf-8", buffering=1)
 
     original_stdout = sys.stdout
@@ -145,6 +145,8 @@ def save_discovered_scenarios(scenarios):
             f,
             fieldnames=[
                 "scenario_id",
+                "language_pair_id",
+                "language_name",
                 "title",
                 "topic_id",
                 "topic_name",
@@ -334,6 +336,103 @@ def choose_language_pair_id(page):
                     return answer
 
         print("Please choose one of the listed numbers, or type a valid language pair ID.")
+
+
+def parse_language_selection(value, language_pairs):
+    value = str(value or "").strip().lower()
+    if not value or value in {"all", "*"}:
+        return language_pairs
+
+    selected = []
+    seen = set()
+
+    for part in re.split(r"[,\s]+", value):
+        if not part:
+            continue
+
+        if "-" in part:
+            start_text, end_text = part.split("-", 1)
+            if not start_text.isdigit() or not end_text.isdigit():
+                raise ValueError(f"Invalid range: {part}")
+
+            start = int(start_text)
+            end = int(end_text)
+            if start > end:
+                start, end = end, start
+
+            choices = [str(number) for number in range(start, end + 1)]
+        else:
+            choices = [part]
+
+        for choice in choices:
+            item = None
+            if choice.isdigit():
+                selected_index = int(choice)
+                if 1 <= selected_index <= len(language_pairs):
+                    item = language_pairs[selected_index - 1]
+                else:
+                    item = next(
+                        (
+                            language_pair
+                            for language_pair in language_pairs
+                            if language_pair["language_pair_id"] == choice
+                        ),
+                        None,
+                    )
+
+            if item is None:
+                raise ValueError(f"Could not match language selection: {choice}")
+
+            language_pair_id = item["language_pair_id"]
+            if language_pair_id not in seen:
+                seen.add(language_pair_id)
+                selected.append(item)
+
+    return selected
+
+
+def choose_language_pair_ids(page):
+    try:
+        language_pairs = list_language_pairs_in_browser(page)
+    except Exception as e:
+        print("\nCould not read your Memrise language list automatically.")
+        print(f"Error: {e}")
+        raw_ids = input("Type language pair IDs separated by commas: ").strip()
+        return [
+            {"language_pair_id": item.strip(), "label": f"Language pair {item.strip()}"}
+            for item in raw_ids.split(",")
+            if item.strip().isdigit()
+        ]
+
+    if not language_pairs:
+        raw_ids = input("\nNo languages found automatically. Type language pair IDs separated by commas: ").strip()
+        return [
+            {"language_pair_id": item.strip(), "label": f"Language pair {item.strip()}"}
+            for item in raw_ids.split(",")
+            if item.strip().isdigit()
+        ]
+
+    print("\nChoose Memrise languages to download:")
+    for index, item in enumerate(language_pairs, start=1):
+        print(f"{index:>3}. {item['label']} ({item['language_pair_id']})")
+
+    print(
+        "\nType all for every language, or choose multiple numbers/IDs.\n"
+        "Examples: 1,3,5 or 1-3 or 12345,67890"
+    )
+
+    while True:
+        answer = input("Languages to download [all]: ").strip()
+        try:
+            selected = parse_language_selection(answer, language_pairs)
+        except ValueError as e:
+            print(e)
+            continue
+
+        if selected:
+            return selected
+
+        print("Please choose at least one language.")
 
 
 def discover_scenarios_in_browser(page, language_pair_id=None):
@@ -798,25 +897,34 @@ def main():
                 save_discovered_scenarios(scenarios)
                 scenario_ids = [item["scenario_id"] for item in scenarios]
             elif input_mode == "auto":
-                language_pair_id = choose_language_pair_id(page)
+                language_pairs = choose_language_pair_ids(page)
+                all_scenarios = []
 
-                print("\nDiscovering scenarios through the logged-in browser...")
-                discovery = discover_scenarios_in_browser(page, language_pair_id or None)
-                scenarios = discovery["scenarios"]
+                for language_pair in language_pairs:
+                    language_pair_id = language_pair["language_pair_id"]
+                    language_name = language_pair.get("label") or f"Language pair {language_pair_id}"
 
-                print(
-                    f"\nLanguage pair: {discovery['language_pair_id']}\n"
-                    f"Topics scanned: {discovery['topic_count']}\n"
-                    f"Scenarios discovered: {len(scenarios)}"
-                )
+                    print(f"\nDiscovering scenarios for {language_name}...")
+                    discovery = discover_scenarios_in_browser(page, language_pair_id or None)
+                    scenarios = discovery["scenarios"]
+
+                    for scenario in scenarios:
+                        scenario["language_pair_id"] = discovery["language_pair_id"]
+                        scenario["language_name"] = language_name
+
+                    all_scenarios.extend(scenarios)
+
+                    print(
+                        f"\nLanguage pair: {discovery['language_pair_id']}\n"
+                        f"Language: {language_name}\n"
+                        f"Topics scanned: {discovery['topic_count']}\n"
+                        f"Scenarios discovered: {len(scenarios)}"
+                    )
+
+                scenarios = all_scenarios
 
                 if not scenarios:
-                    print(
-                        "\nLive discovery did not return scenarios. "
-                        "Trying the saved network-capture CSV..."
-                    )
-                    scenarios = load_scenarios_from_capture_csv()
-                    print(f"Scenarios loaded from capture CSV: {len(scenarios)}")
+                    print("\nLive discovery did not return scenarios for the selected languages.")
 
                 save_discovered_scenarios(scenarios)
                 scenario_ids = [item["scenario_id"] for item in scenarios]
@@ -835,8 +943,16 @@ def main():
                 return
 
             print("\nLessons queued:")
+            scenario_lookup = {
+                str(scenario.get("scenario_id")): scenario
+                for scenario in locals().get("scenarios", [])
+            }
             for scenario_id in scenario_ids:
-                print(" -", scenario_id)
+                scenario = scenario_lookup.get(scenario_id, {})
+                language_name = scenario.get("language_name")
+                title = scenario.get("title")
+                details = " - ".join(item for item in [language_name, title] if item)
+                print(f" - {scenario_id}" + (f": {details}" if details else ""))
 
             print("\nReading lessons through the logged-in browser...")
             lesson_payloads = fetch_lessons_in_browser_chunks(page, scenario_ids)

@@ -190,20 +190,25 @@ def wait_for_lesson_page(context):
 
 def download_file(url, output_path):
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(output_path.name + ".part")
 
     if output_path.exists():
         print(f"Skipping existing: {output_path.name}")
         return
 
     print(f"Downloading: {output_path.name}")
+    if temp_path.exists():
+        temp_path.unlink()
 
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
 
-        with open(output_path, "wb") as f:
+        with open(temp_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 256):
                 if chunk:
                     f.write(chunk)
+
+    temp_path.replace(output_path)
 
 
 def fetch_json(page, url):
