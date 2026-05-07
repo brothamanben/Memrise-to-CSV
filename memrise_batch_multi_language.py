@@ -14,7 +14,9 @@ from memrise_single_lesson import (
     clean_name,
     detect_scenario_id,
     download_file,
+    ensure_memrise_login,
     get_clipboard_text,
+    media_filename,
 )
 
 
@@ -153,6 +155,7 @@ def save_discovered_scenarios(scenarios):
                 "number_of_learnables",
                 "link",
             ],
+            extrasaction="ignore",
         )
         writer.writeheader()
         writer.writerows(scenarios)
@@ -186,6 +189,8 @@ def load_scenarios_from_capture_csv():
             scenarios.append(
                 {
                     "scenario_id": scenario_id,
+                    "language_pair_id": row.get("language_pair_id", ""),
+                    "language_name": row.get("language_name", ""),
                     "title": row.get("title", ""),
                     "topic_id": "",
                     "topic_name": "",
@@ -327,13 +332,13 @@ def choose_language_pair_id(page):
     while True:
         answer = input("Choose a language number or type a language pair ID: ").strip()
         if answer.isdigit():
-            selected_index = int(answer)
-            if 1 <= selected_index <= len(language_pairs):
-                return language_pairs[selected_index - 1]["language_pair_id"]
-
             for item in language_pairs:
                 if item["language_pair_id"] == answer:
                     return answer
+
+            selected_index = int(answer)
+            if 1 <= selected_index <= len(language_pairs):
+                return language_pairs[selected_index - 1]["language_pair_id"]
 
         print("Please choose one of the listed numbers, or type a valid language pair ID.")
 
@@ -367,18 +372,19 @@ def parse_language_selection(value, language_pairs):
         for choice in choices:
             item = None
             if choice.isdigit():
-                selected_index = int(choice)
-                if 1 <= selected_index <= len(language_pairs):
-                    item = language_pairs[selected_index - 1]
-                else:
-                    item = next(
-                        (
-                            language_pair
-                            for language_pair in language_pairs
-                            if language_pair["language_pair_id"] == choice
-                        ),
-                        None,
-                    )
+                item = next(
+                    (
+                        language_pair
+                        for language_pair in language_pairs
+                        if language_pair["language_pair_id"] == choice
+                    ),
+                    None,
+                )
+
+                if item is None:
+                    selected_index = int(choice)
+                    if 1 <= selected_index <= len(language_pairs):
+                        item = language_pairs[selected_index - 1]
 
             if item is None:
                 raise ValueError(f"Could not match language selection: {choice}")
@@ -433,6 +439,125 @@ def choose_language_pair_ids(page):
             return selected
 
         print("Please choose at least one language.")
+
+
+def scenario_sort_key(item):
+    language = str(item.get("language_name") or item.get("language_pair_id") or "")
+    scenario_id = str(item.get("scenario_id") or "")
+    scenario_key = int(scenario_id) if scenario_id.isdigit() else scenario_id
+    return (language.lower(), scenario_key)
+
+
+def parse_lesson_selection(value, total):
+    value = str(value or "").strip().lower()
+    if not value or value in {"all", "*"}:
+        return list(range(total))
+
+    if value.isdigit():
+        count = int(value)
+        if 1 <= count <= total:
+            return list(range(count))
+        raise ValueError(f"Count must be between 1 and {total}.")
+
+    selected = []
+    seen = set()
+
+    for part in re.split(r"[,\s]+", value):
+        if not part:
+            continue
+
+        if "-" in part:
+            start_text, end_text = part.split("-", 1)
+            if not start_text.isdigit() or not end_text.isdigit():
+                raise ValueError(f"Invalid range: {part}")
+
+            start = int(start_text)
+            end = int(end_text)
+            if start > end:
+                start, end = end, start
+
+            numbers = range(start, end + 1)
+        elif part.isdigit():
+            numbers = [int(part)]
+        else:
+            raise ValueError(f"Invalid lesson number: {part}")
+
+        for number in numbers:
+            if not 1 <= number <= total:
+                raise ValueError(f"Lesson number {number} is outside 1-{total}.")
+
+            index = number - 1
+            if index not in seen:
+                seen.add(index)
+                selected.append(index)
+
+    return selected
+
+
+def choose_scenarios_to_download(scenarios):
+    ordered = sorted(scenarios, key=scenario_sort_key)
+    review_path = OUTPUT_DIR / "memrise_multi_language_download_review.csv"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    with open(review_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "selection_number",
+                "language_name",
+                "language_pair_id",
+                "scenario_id",
+                "title",
+                "topic_id",
+                "topic_name",
+                "number_of_learnables",
+                "link",
+            ],
+            extrasaction="ignore",
+        )
+        writer.writeheader()
+        for index, scenario in enumerate(ordered, start=1):
+            row = dict(scenario)
+            row["selection_number"] = index
+            writer.writerow(row)
+
+    print(f"\nReview CSV saved: {review_path}")
+    print("\nLessons found for the selected languages")
+    print("-" * 118)
+    print(f"{'#':>4}  {'Language':<30}  {'Scenario ID':<12}  {'Lesson Name':<45}  {'Items':>7}")
+    print("-" * 118)
+
+    for index, scenario in enumerate(ordered, start=1):
+        language = re.sub(r"\s+", " ", str(scenario.get("language_name") or "")).strip()
+        title = re.sub(r"\s+", " ", str(scenario.get("title") or "(no title)")).strip()
+        scenario_id = str(scenario.get("scenario_id") or "")
+        item_count = str(scenario.get("number_of_learnables") or "")
+
+        if len(language) > 30:
+            language = language[:27] + "..."
+        if len(title) > 45:
+            title = title[:42] + "..."
+
+        print(f"{index:>4}  {language:<30}  {scenario_id:<12}  {title:<45}  {item_count:>7}")
+
+    print("-" * 118)
+    print(f"Total lessons available: {len(ordered)}")
+    print(
+        "\nChoose exactly what to download.\n"
+        "- Press ENTER or type all for every lesson.\n"
+        "- Type a number like 10 to download the first 10 listed lessons.\n"
+        "- Type ranges like 1-7 or 8-14, or combine them like 1-7,15,20-25.\n"
+    )
+
+    while True:
+        answer = input("Lessons to download [all]: ").strip()
+        try:
+            selected_indexes = parse_lesson_selection(answer, len(ordered))
+        except ValueError as e:
+            print(e)
+            continue
+
+        return [ordered[index] for index in selected_indexes]
 
 
 def discover_scenarios_in_browser(page, language_pair_id=None):
@@ -639,6 +764,24 @@ def fetch_lessons_in_browser_chunks(page, scenario_ids, chunk_size=8):
     return payloads
 
 
+def attach_scenario_metadata(payloads, scenarios):
+    scenario_lookup = {
+        str(scenario.get("scenario_id")): scenario
+        for scenario in scenarios or []
+    }
+
+    for payload in payloads:
+        scenario = scenario_lookup.get(str(payload.get("scenario_id")), {})
+        if scenario.get("language_pair_id"):
+            payload["language_pair_id"] = scenario.get("language_pair_id")
+        if scenario.get("language_name"):
+            payload["language_name"] = scenario.get("language_name")
+        if scenario.get("title") and not payload.get("title"):
+            payload["title"] = scenario.get("title")
+
+    return payloads
+
+
 def fetch_lessons_in_browser(page, scenario_ids):
     return page.evaluate(
         """
@@ -665,15 +808,23 @@ def fetch_lessons_in_browser(page, scenario_ids):
 
                     const learnables = await Promise.all(learnableIds.map(
                         async (learnableId, index) => {
-                            const details = await getJson(
-                                `https://app.memrise.com/v1.25/learnable_details/${learnableId}/`
-                            );
+                            try {
+                                const details = await getJson(
+                                    `https://app.memrise.com/v1.25/learnable_details/${learnableId}/`
+                                );
 
-                            return {
-                                index: index + 1,
-                                learnable_id: learnableId,
-                                details,
-                            };
+                                return {
+                                    index: index + 1,
+                                    learnable_id: learnableId,
+                                    details,
+                                };
+                            } catch (error) {
+                                return {
+                                    index: index + 1,
+                                    learnable_id: learnableId,
+                                    error: String(error && error.message ? error.message : error),
+                                };
+                            }
                         }
                     ));
 
@@ -696,22 +847,44 @@ def fetch_lessons_in_browser(page, scenario_ids):
     )
 
 
+def lesson_metadata_label(payload):
+    scenario_id = str(payload.get("scenario_id") or "")
+    language = str(payload.get("language_name") or payload.get("language_pair_id") or "").strip()
+    title = str(payload.get("title") or "").strip()
+    parts = [part for part in [language, title, f"scenario_id={scenario_id}"] if part]
+    return " | ".join(parts)
+
+
 def rows_from_lesson_payload(payload):
     rows = []
+    metadata = lesson_metadata_label(payload)
 
     for item in sorted(payload["learnables"], key=lambda value: value["index"]):
+        if item.get("error"):
+            log(f"[{payload['scenario_id']}] Skipping learnable {item.get('learnable_id')}: {item['error']}")
+            continue
+
         index = item["index"]
-        details = item["details"]
-        front = details.get("source_value", "") or ""
-        back = details.get("target_value", "") or ""
-        base = f"{index:03d}_{clean_name(front)}"
+        details = item.get("details") or {}
+        learnable_id = item.get("learnable_id", "")
+        front = details.get("target_value", "") or ""
+        back = details.get("source_value", "") or ""
 
         audio_items = []
         for i, url in enumerate(details.get("audio_urls") or [], start=1):
             audio_items.append(
                 {
                     "url": url,
-                    "filename": f"{base}_audio_{i}.mp3",
+                    "filename": media_filename(
+                        payload.get("scenario_id", ""),
+                        learnable_id,
+                        index,
+                        front,
+                        "audio",
+                        i,
+                        "mp3",
+                        payload.get("language_pair_id", ""),
+                    ),
                 }
             )
 
@@ -720,12 +893,22 @@ def rows_from_lesson_payload(payload):
             video_items.append(
                 {
                     "url": url,
-                    "filename": f"{base}_video_{i}.mp4",
+                    "filename": media_filename(
+                        payload.get("scenario_id", ""),
+                        learnable_id,
+                        index,
+                        front,
+                        "video",
+                        i,
+                        "mp4",
+                        payload.get("language_pair_id", ""),
+                    ),
                 }
             )
 
         rows.append(
             {
+                "language": metadata,
                 "front": front,
                 "back": back,
                 "audio": audio_items,
@@ -741,12 +924,12 @@ def write_csv(rows, csv_path):
 
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["Front", "Back", "Audio", "Video"])
+        writer.writerow(["Language / Lesson / Scenario ID", "Front", "Back", "Audio", "Video"])
 
         for row in rows:
             audio_field = " ".join(f"[sound:{a['filename']}]" for a in row["audio"])
             video_field = " ".join(f"[sound:{v['filename']}]" for v in row["video"])
-            writer.writerow([row["front"], row["back"], audio_field, video_field])
+            writer.writerow([row["language"], row["front"], row["back"], audio_field, video_field])
 
 
 def write_media_list(rows, media_list_path):
@@ -761,6 +944,7 @@ def write_media_list(rows, media_list_path):
 
 def download_lesson_media(rows, audio_dir, video_dir):
     jobs = []
+    errors = []
 
     with ThreadPoolExecutor(max_workers=MAX_MEDIA_WORKERS) as executor:
         for row in rows:
@@ -783,7 +967,13 @@ def download_lesson_media(rows, audio_dir, video_dir):
                 )
 
         for future in as_completed(jobs):
-            future.result()
+            try:
+                future.result()
+            except Exception as e:
+                errors.append(str(e))
+                log(f"Media download failed; skipping file: {e}")
+
+    return errors
 
 
 def media_file_count(rows):
@@ -849,14 +1039,19 @@ def export_lesson_payload(payload):
     write_media_list(rows, media_list_path)
 
     log(f"[{scenario_id}] Downloading media...")
-    download_lesson_media(rows, audio_dir, video_dir)
-    complete_path.write_text(
-        f"scenario_id={scenario_id}\n"
-        f"rows={len(rows)}\n"
-        f"media_files={media_file_count(rows)}\n"
-        f"completed_at={datetime.now().isoformat(timespec='seconds')}\n",
-        encoding="utf-8",
-    )
+    media_errors = download_lesson_media(rows, audio_dir, video_dir)
+    if media_errors:
+        error_path = lesson_dir / "download_errors.txt"
+        error_path.write_text("\n".join(media_errors), encoding="utf-8")
+        log(f"[{scenario_id}] Finished with {len(media_errors)} skipped media files.")
+    else:
+        complete_path.write_text(
+            f"scenario_id={scenario_id}\n"
+            f"rows={len(rows)}\n"
+            f"media_files={media_file_count(rows)}\n"
+            f"completed_at={datetime.now().isoformat(timespec='seconds')}\n",
+            encoding="utf-8",
+        )
 
     return {
         "scenario_id": scenario_id,
@@ -864,6 +1059,7 @@ def export_lesson_payload(payload):
         "folder": lesson_dir,
         "csv": csv_path,
         "media_links": media_list_path,
+        "media_errors": len(media_errors),
         "skipped": False,
     }
 
@@ -882,10 +1078,11 @@ def main():
             page = context.new_page()
             page.goto("https://app.memrise.com/", wait_until="domcontentloaded")
 
-            input(
-                "\nBrowser opened.\n"
-                "Log into Memrise if needed, then press ENTER here.\n\n"
-            )
+            if not ensure_memrise_login(page):
+                input(
+                    "\nBrowser opened.\n"
+                    "Log into Memrise if needed, then press ENTER here.\n\n"
+                )
 
             input_mode = choose_input_mode()
 
@@ -942,10 +1139,45 @@ def main():
                 context.close()
                 return
 
-            print("\nLessons queued:")
             scenario_lookup = {
                 str(scenario.get("scenario_id")): scenario
                 for scenario in locals().get("scenarios", [])
+            }
+            scenarios = []
+            seen_scenario_ids = set()
+
+            for scenario_id in scenario_ids:
+                if scenario_id in seen_scenario_ids:
+                    continue
+
+                seen_scenario_ids.add(scenario_id)
+                scenario = dict(scenario_lookup.get(scenario_id, {}))
+                scenario["scenario_id"] = scenario_id
+                scenario.setdefault("title", "")
+                scenario.setdefault("topic_id", "")
+                scenario.setdefault("topic_name", "")
+                scenario.setdefault("number_of_learnables", "")
+                scenario.setdefault(
+                    "link",
+                    (
+                        "https://app.memrise.com/aprender/learn?"
+                        f"scenario_id={scenario_id}&source=scenarios_tab&back=%2Flearn"
+                    ),
+                )
+                scenarios.append(scenario)
+
+            scenarios = choose_scenarios_to_download(scenarios)
+            scenario_ids = [item["scenario_id"] for item in scenarios]
+
+            if not scenario_ids:
+                print("\nNo lessons selected. Exiting.")
+                context.close()
+                return
+
+            print("\nLessons queued:")
+            scenario_lookup = {
+                str(scenario.get("scenario_id")): scenario
+                for scenario in scenarios
             }
             for scenario_id in scenario_ids:
                 scenario = scenario_lookup.get(scenario_id, {})
@@ -956,6 +1188,7 @@ def main():
 
             print("\nReading lessons through the logged-in browser...")
             lesson_payloads = fetch_lessons_in_browser_chunks(page, scenario_ids)
+            attach_scenario_metadata(lesson_payloads, locals().get("scenarios", []))
 
             results = []
             errors = []
@@ -993,6 +1226,8 @@ def main():
                     print(f"  Folder: {result['folder']}")
                     print(f"  CSV: {result['csv']}")
                     print(f"  Media links: {result['media_links']}")
+                    if result.get("media_errors"):
+                        print(f"  Skipped media files: {result['media_errors']}")
 
             if errors:
                 print("\nFailed lessons:")

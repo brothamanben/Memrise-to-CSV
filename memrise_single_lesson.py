@@ -1,6 +1,7 @@
 from pathlib import Path
 import csv
 import html
+import os
 import re
 import requests
 from urllib.parse import urlparse, parse_qs
@@ -9,6 +10,8 @@ from playwright.sync_api import sync_playwright
 
 OUTPUT_DIR = Path("memrise_downloads")
 PROFILE_DIR = Path("memrise_browser_profile")
+MEMRISE_EMAIL = os.environ.get("MEMRISE_EMAIL", "fooheads@gmail.com")
+MEMRISE_PASSWORD = os.environ.get("MEMRISE_PASSWORD", "Panchenyumemrise1127!")
 
 
 def clean_name(value, fallback="item", max_len=60):
@@ -16,6 +19,26 @@ def clean_name(value, fallback="item", max_len=60):
     value = re.sub(r'[\\/:*?"<>|]+', "", value)
     value = re.sub(r"\s+", "_", value.strip())
     return value[:max_len] or fallback
+
+
+def media_filename(scenario_id, learnable_id, index, front, kind, number, extension, language_pair_id=""):
+    parts = ["memrise"]
+
+    if language_pair_id:
+        parts.append(f"lp{clean_name(language_pair_id, max_len=24)}")
+
+    parts.extend(
+        [
+            f"s{clean_name(scenario_id, fallback='scenario', max_len=24)}",
+            f"l{clean_name(learnable_id, fallback='learnable', max_len=24)}",
+            f"{index:03d}",
+            clean_name(front, fallback="item", max_len=36),
+            kind,
+            str(number),
+        ]
+    )
+
+    return "_".join(parts) + f".{extension.lstrip('.')}"
 
 
 def detect_scenario_id(url):
@@ -60,6 +83,10 @@ def strip_tags(value):
     value = re.sub(r"<[^>]+>", "\n", value)
     value = html.unescape(value)
     return value.replace("\r", "\n")
+
+
+def console_safe(value):
+    return str(value).encode("ascii", "backslashreplace").decode("ascii")
 
 
 def extract_rows_from_visible_text(value):
@@ -193,10 +220,10 @@ def download_file(url, output_path):
     temp_path = output_path.with_name(output_path.name + ".part")
 
     if output_path.exists():
-        print(f"Skipping existing: {output_path.name}")
+        print(f"Skipping existing: {console_safe(output_path.name)}")
         return
 
-    print(f"Downloading: {output_path.name}")
+    print(f"Downloading: {console_safe(output_path.name)}")
     if temp_path.exists():
         temp_path.unlink()
 
@@ -209,6 +236,97 @@ def download_file(url, output_path):
                     f.write(chunk)
 
     temp_path.replace(output_path)
+
+
+def memrise_login_status(page):
+    try:
+        return page.evaluate(
+            """
+            async () => {
+                const response = await fetch("https://app.memrise.com/v1.25/me/", {
+                    credentials: "include",
+                });
+                return {
+                    ok: response.ok,
+                    status: response.status,
+                    url: location.href,
+                };
+            }
+            """
+        )
+    except Exception as e:
+        return {"ok": False, "status": "", "error": str(e), "url": getattr(page, "url", "")}
+
+
+def ensure_memrise_login(page):
+    status = memrise_login_status(page)
+    if status.get("ok"):
+        print("\nAlready logged into Memrise.")
+        return True
+
+    print("\nNot logged into Memrise yet. Trying automatic login...")
+
+    try:
+        page.goto("https://app.memrise.com/signin", wait_until="domcontentloaded")
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+
+    email_selectors = [
+        "input[type='email']",
+        "input[name='email']",
+        "input[name='username']",
+        "input[autocomplete='email']",
+        "input[placeholder*='email' i]",
+    ]
+    password_selectors = [
+        "input[type='password']",
+        "input[name='password']",
+        "input[autocomplete='current-password']",
+    ]
+
+    try:
+        email_field = next(
+            (page.locator(selector).first for selector in email_selectors if page.locator(selector).count()),
+            None,
+        )
+        password_field = next(
+            (page.locator(selector).first for selector in password_selectors if page.locator(selector).count()),
+            None,
+        )
+
+        if not email_field or not password_field:
+            print("Could not find Memrise login fields automatically.")
+            return False
+
+        email_field.fill(MEMRISE_EMAIL)
+        password_field.fill(MEMRISE_PASSWORD)
+
+        submit = page.locator(
+            "button[type='submit'], input[type='submit'], button:has-text('Log in'), button:has-text('Sign in')"
+        ).first
+        if submit.count():
+            submit.click()
+        else:
+            password_field.press("Enter")
+
+        try:
+            page.wait_for_load_state("networkidle", timeout=20000)
+        except Exception:
+            pass
+
+        page.wait_for_timeout(1500)
+        status = memrise_login_status(page)
+        if status.get("ok"):
+            print("Automatic Memrise login succeeded.")
+            return True
+
+        print(f"Automatic login did not complete. Login API status: {status.get('status')}")
+        return False
+    except Exception as e:
+        print("Automatic login failed.")
+        print(e)
+        return False
 
 
 def fetch_json(page, url):
@@ -234,13 +352,14 @@ def write_lesson_outputs(rows, csv_path, media_list_path, audio_dir, video_dir, 
 
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["Front", "Back", "Audio", "Video"])
+        writer.writerow(["Language / Lesson / Scenario ID", "Front", "Back", "Audio", "Video"])
 
         for row in rows:
             audio_field = " ".join(f"[sound:{a['filename']}]" for a in row["audio"])
             video_field = " ".join(f"[sound:{v['filename']}]" for v in row["video"])
 
             writer.writerow([
+                row.get("language", ""),
                 row["front"],
                 row["back"],
                 audio_field,
@@ -256,12 +375,18 @@ def write_lesson_outputs(rows, csv_path, media_list_path, audio_dir, video_dir, 
             for audio_item in row["audio"]:
                 f.write(f"{audio_item['url']} -> {audio_item['filename']}\n")
                 if download_media:
-                    download_file(audio_item["url"], audio_dir / audio_item["filename"])
+                    try:
+                        download_file(audio_item["url"], audio_dir / audio_item["filename"])
+                    except Exception as e:
+                        print(f"Media download failed; skipping file: {e}")
 
             for video_item in row["video"]:
                 f.write(f"{video_item['url']} -> {video_item['filename']}\n")
                 if download_media:
-                    download_file(video_item["url"], video_dir / video_item["filename"])
+                    try:
+                        download_file(video_item["url"], video_dir / video_item["filename"])
+                    except Exception as e:
+                        print(f"Media download failed; skipping file: {e}")
 
 
 def main():
@@ -275,12 +400,13 @@ def main():
         page = context.new_page()
         page.goto("https://app.memrise.com/", wait_until="domcontentloaded")
 
-        input(
-            "\nBrowser opened.\n"
-            "1. Log into Memrise if needed.\n"
-            "2. You can either paste a lesson URL/ID next, or open your lesson page in THIS browser window.\n"
-            "3. Press ENTER here when ready.\n\n"
-        )
+        if not ensure_memrise_login(page):
+            input(
+                "\nBrowser opened.\n"
+                "1. Log into Memrise if needed.\n"
+                "2. You can either paste a lesson URL/ID next, or open your lesson page in THIS browser window.\n"
+                "3. Press ENTER here when ready.\n\n"
+            )
 
         scenario_id = ask_for_lesson_id_or_url()
         if scenario_id:
@@ -338,26 +464,44 @@ def main():
                 f"https://app.memrise.com/v1.25/learnable_details/{learnable_id}/",
             )
 
-            front = details.get("source_value", "") or ""
-            back = details.get("target_value", "") or ""
-
-            base = f"{index:03d}_{clean_name(front)}"
+            front = details.get("target_value", "") or ""
+            back = details.get("source_value", "") or ""
+            language_pair_id = data.get("language_pair_id") or data.get("languagePairId") or ""
 
             audio_items = []
             for i, url in enumerate(details.get("audio_urls") or [], start=1):
                 audio_items.append({
                     "url": url,
-                    "filename": f"{base}_audio_{i}.mp3",
+                    "filename": media_filename(
+                        scenario_id,
+                        learnable_id,
+                        index,
+                        front,
+                        "audio",
+                        i,
+                        "mp3",
+                        language_pair_id,
+                    ),
                 })
 
             video_items = []
             for i, url in enumerate(details.get("video_urls") or [], start=1):
                 video_items.append({
                     "url": url,
-                    "filename": f"{base}_video_{i}.mp4",
+                    "filename": media_filename(
+                        scenario_id,
+                        learnable_id,
+                        index,
+                        front,
+                        "video",
+                        i,
+                        "mp4",
+                        language_pair_id,
+                    ),
                 })
 
             rows.append({
+                "language": f"{data.get('title') or ''} | scenario_id={scenario_id}",
                 "front": front,
                 "back": back,
                 "audio": audio_items,

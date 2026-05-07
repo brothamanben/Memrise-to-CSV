@@ -14,7 +14,9 @@ from memrise_single_lesson import (
     clean_name,
     detect_scenario_id,
     download_file,
+    ensure_memrise_login,
     get_clipboard_text,
+    media_filename,
 )
 
 
@@ -145,6 +147,8 @@ def save_discovered_scenarios(scenarios):
             f,
             fieldnames=[
                 "scenario_id",
+                "language_pair_id",
+                "language_name",
                 "title",
                 "topic_id",
                 "topic_name",
@@ -184,6 +188,8 @@ def load_scenarios_from_capture_csv():
             scenarios.append(
                 {
                     "scenario_id": scenario_id,
+                    "language_pair_id": row.get("language_pair_id", ""),
+                    "language_name": row.get("language_name", ""),
                     "title": row.get("title", ""),
                     "topic_id": "",
                     "topic_name": "",
@@ -325,15 +331,26 @@ def choose_language_pair_id(page):
     while True:
         answer = input("Choose a language number or type a language pair ID: ").strip()
         if answer.isdigit():
-            selected_index = int(answer)
-            if 1 <= selected_index <= len(language_pairs):
-                return language_pairs[selected_index - 1]["language_pair_id"]
-
             for item in language_pairs:
                 if item["language_pair_id"] == answer:
                     return answer
 
+            selected_index = int(answer)
+            if 1 <= selected_index <= len(language_pairs):
+                return language_pairs[selected_index - 1]["language_pair_id"]
+
         print("Please choose one of the listed numbers, or type a valid language pair ID.")
+
+
+def language_label_for_pair(page, language_pair_id):
+    try:
+        for item in list_language_pairs_in_browser(page):
+            if item["language_pair_id"] == str(language_pair_id):
+                return item["label"]
+    except Exception:
+        pass
+
+    return f"Language pair {language_pair_id}"
 
 
 def discover_scenarios_in_browser(page, language_pair_id=None):
@@ -540,6 +557,24 @@ def fetch_lessons_in_browser_chunks(page, scenario_ids, chunk_size=8):
     return payloads
 
 
+def attach_scenario_metadata(payloads, scenarios):
+    scenario_lookup = {
+        str(scenario.get("scenario_id")): scenario
+        for scenario in scenarios or []
+    }
+
+    for payload in payloads:
+        scenario = scenario_lookup.get(str(payload.get("scenario_id")), {})
+        if scenario.get("language_pair_id"):
+            payload["language_pair_id"] = scenario.get("language_pair_id")
+        if scenario.get("language_name"):
+            payload["language_name"] = scenario.get("language_name")
+        if scenario.get("title") and not payload.get("title"):
+            payload["title"] = scenario.get("title")
+
+    return payloads
+
+
 def fetch_lessons_in_browser(page, scenario_ids):
     return page.evaluate(
         """
@@ -566,15 +601,23 @@ def fetch_lessons_in_browser(page, scenario_ids):
 
                     const learnables = await Promise.all(learnableIds.map(
                         async (learnableId, index) => {
-                            const details = await getJson(
-                                `https://app.memrise.com/v1.25/learnable_details/${learnableId}/`
-                            );
+                            try {
+                                const details = await getJson(
+                                    `https://app.memrise.com/v1.25/learnable_details/${learnableId}/`
+                                );
 
-                            return {
-                                index: index + 1,
-                                learnable_id: learnableId,
-                                details,
-                            };
+                                return {
+                                    index: index + 1,
+                                    learnable_id: learnableId,
+                                    details,
+                                };
+                            } catch (error) {
+                                return {
+                                    index: index + 1,
+                                    learnable_id: learnableId,
+                                    error: String(error && error.message ? error.message : error),
+                                };
+                            }
                         }
                     ));
 
@@ -597,22 +640,44 @@ def fetch_lessons_in_browser(page, scenario_ids):
     )
 
 
+def lesson_metadata_label(payload):
+    scenario_id = str(payload.get("scenario_id") or "")
+    language = str(payload.get("language_name") or payload.get("language_pair_id") or "").strip()
+    title = str(payload.get("title") or "").strip()
+    parts = [part for part in [language, title, f"scenario_id={scenario_id}"] if part]
+    return " | ".join(parts)
+
+
 def rows_from_lesson_payload(payload):
     rows = []
+    metadata = lesson_metadata_label(payload)
 
     for item in sorted(payload["learnables"], key=lambda value: value["index"]):
+        if item.get("error"):
+            log(f"[{payload['scenario_id']}] Skipping learnable {item.get('learnable_id')}: {item['error']}")
+            continue
+
         index = item["index"]
-        details = item["details"]
-        front = details.get("source_value", "") or ""
-        back = details.get("target_value", "") or ""
-        base = f"{index:03d}_{clean_name(front)}"
+        details = item.get("details") or {}
+        learnable_id = item.get("learnable_id", "")
+        front = details.get("target_value", "") or ""
+        back = details.get("source_value", "") or ""
 
         audio_items = []
         for i, url in enumerate(details.get("audio_urls") or [], start=1):
             audio_items.append(
                 {
                     "url": url,
-                    "filename": f"{base}_audio_{i}.mp3",
+                    "filename": media_filename(
+                        payload.get("scenario_id", ""),
+                        learnable_id,
+                        index,
+                        front,
+                        "audio",
+                        i,
+                        "mp3",
+                        payload.get("language_pair_id", ""),
+                    ),
                 }
             )
 
@@ -621,12 +686,22 @@ def rows_from_lesson_payload(payload):
             video_items.append(
                 {
                     "url": url,
-                    "filename": f"{base}_video_{i}.mp4",
+                    "filename": media_filename(
+                        payload.get("scenario_id", ""),
+                        learnable_id,
+                        index,
+                        front,
+                        "video",
+                        i,
+                        "mp4",
+                        payload.get("language_pair_id", ""),
+                    ),
                 }
             )
 
         rows.append(
             {
+                "language": metadata,
                 "front": front,
                 "back": back,
                 "audio": audio_items,
@@ -642,12 +717,12 @@ def write_csv(rows, csv_path):
 
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["Front", "Back", "Audio", "Video"])
+        writer.writerow(["Language / Lesson / Scenario ID", "Front", "Back", "Audio", "Video"])
 
         for row in rows:
             audio_field = " ".join(f"[sound:{a['filename']}]" for a in row["audio"])
             video_field = " ".join(f"[sound:{v['filename']}]" for v in row["video"])
-            writer.writerow([row["front"], row["back"], audio_field, video_field])
+            writer.writerow([row["language"], row["front"], row["back"], audio_field, video_field])
 
 
 def write_media_list(rows, media_list_path):
@@ -662,6 +737,7 @@ def write_media_list(rows, media_list_path):
 
 def download_lesson_media(rows, audio_dir, video_dir):
     jobs = []
+    errors = []
 
     with ThreadPoolExecutor(max_workers=MAX_MEDIA_WORKERS) as executor:
         for row in rows:
@@ -684,7 +760,13 @@ def download_lesson_media(rows, audio_dir, video_dir):
                 )
 
         for future in as_completed(jobs):
-            future.result()
+            try:
+                future.result()
+            except Exception as e:
+                errors.append(str(e))
+                log(f"Media download failed; skipping file: {e}")
+
+    return errors
 
 
 def media_file_count(rows):
@@ -750,14 +832,19 @@ def export_lesson_payload(payload):
     write_media_list(rows, media_list_path)
 
     log(f"[{scenario_id}] Downloading media...")
-    download_lesson_media(rows, audio_dir, video_dir)
-    complete_path.write_text(
-        f"scenario_id={scenario_id}\n"
-        f"rows={len(rows)}\n"
-        f"media_files={media_file_count(rows)}\n"
-        f"completed_at={datetime.now().isoformat(timespec='seconds')}\n",
-        encoding="utf-8",
-    )
+    media_errors = download_lesson_media(rows, audio_dir, video_dir)
+    if media_errors:
+        error_path = lesson_dir / "download_errors.txt"
+        error_path.write_text("\n".join(media_errors), encoding="utf-8")
+        log(f"[{scenario_id}] Finished with {len(media_errors)} skipped media files.")
+    else:
+        complete_path.write_text(
+            f"scenario_id={scenario_id}\n"
+            f"rows={len(rows)}\n"
+            f"media_files={media_file_count(rows)}\n"
+            f"completed_at={datetime.now().isoformat(timespec='seconds')}\n",
+            encoding="utf-8",
+        )
 
     return {
         "scenario_id": scenario_id,
@@ -765,6 +852,7 @@ def export_lesson_payload(payload):
         "folder": lesson_dir,
         "csv": csv_path,
         "media_links": media_list_path,
+        "media_errors": len(media_errors),
         "skipped": False,
     }
 
@@ -783,10 +871,11 @@ def main():
             page = context.new_page()
             page.goto("https://app.memrise.com/", wait_until="domcontentloaded")
 
-            input(
-                "\nBrowser opened.\n"
-                "Log into Memrise if needed, then press ENTER here.\n\n"
-            )
+            if not ensure_memrise_login(page):
+                input(
+                    "\nBrowser opened.\n"
+                    "Log into Memrise if needed, then press ENTER here.\n\n"
+                )
 
             input_mode = choose_input_mode()
 
@@ -803,9 +892,15 @@ def main():
                 print("\nDiscovering scenarios through the logged-in browser...")
                 discovery = discover_scenarios_in_browser(page, language_pair_id or None)
                 scenarios = discovery["scenarios"]
+                language_name = language_label_for_pair(page, discovery["language_pair_id"])
+
+                for scenario in scenarios:
+                    scenario["language_pair_id"] = discovery["language_pair_id"]
+                    scenario["language_name"] = language_name
 
                 print(
                     f"\nLanguage pair: {discovery['language_pair_id']}\n"
+                    f"Language: {language_name}\n"
                     f"Topics scanned: {discovery['topic_count']}\n"
                     f"Scenarios discovered: {len(scenarios)}"
                 )
@@ -840,6 +935,7 @@ def main():
 
             print("\nReading lessons through the logged-in browser...")
             lesson_payloads = fetch_lessons_in_browser_chunks(page, scenario_ids)
+            attach_scenario_metadata(lesson_payloads, locals().get("scenarios", []))
 
             results = []
             errors = []
@@ -877,6 +973,8 @@ def main():
                     print(f"  Folder: {result['folder']}")
                     print(f"  CSV: {result['csv']}")
                     print(f"  Media links: {result['media_links']}")
+                    if result.get("media_errors"):
+                        print(f"  Skipped media files: {result['media_errors']}")
 
             if errors:
                 print("\nFailed lessons:")
